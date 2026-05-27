@@ -1,0 +1,51 @@
+name: Deploy — Terraform apply on merge
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infra/**'
+
+env:
+  TF_VERSION: '1.7.0'
+  ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+  ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+  ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+
+jobs:
+  terraform:
+    name: Terraform plan + apply
+    runs-on: ubuntu-latest
+    environment: production
+
+    defaults:
+      run:
+        working-directory: infra
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform init
+        run: terraform init
+
+      - name: Terraform validate
+        run: terraform validate
+
+      - name: Terraform plan
+        run: |
+          terraform plan \
+            -var="synapse_sql_password=${{ secrets.SYNAPSE_SQL_PASSWORD }}" \
+            -out=tfplan
+
+      - name: Terraform apply
+        run: terraform apply -auto-approve tfplan
+
+      - name: Export outputs to GitHub env
+        run: |
+          echo "ADLS_ACCOUNT=$(terraform output -raw adls_account_name)" >> $GITHUB_ENV
+          echo "SYNAPSE_ENDPOINT=$(terraform output -raw synapse_sql_endpoint)" >> $GITHUB_ENV

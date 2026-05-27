@@ -1,0 +1,129 @@
+name: CI — dbt tests + data quality
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'dbt_project/**'
+      - 'quality/**'
+      - 'streaming/**'
+      - 'producer/**'
+
+jobs:
+  # ── 1. Python lint + unit tests ─────────────────────────────────────────────
+  python-checks:
+    name: Python lint & unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Lint (ruff)
+        run: ruff check streaming/ producer/ quality/ airflow/
+
+      - name: Type check (mypy)
+        run: mypy streaming/ producer/ --ignore-missing-imports
+
+      - name: Unit tests
+        run: pytest tests/ -v --tb=short
+
+  # ── 2. dbt compile + schema check ────────────────────────────────────────────
+  dbt-compile:
+    name: dbt compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dbt
+        run: pip install dbt-synapse dbt-utils
+
+      - name: dbt deps
+        working-directory: dbt_project
+        run: dbt deps
+
+      - name: dbt compile (validates all SQL, no DB connection needed)
+        working-directory: dbt_project
+        run: dbt compile --profiles-dir ./ci_profiles --target ci
+        env:
+          DBT_SYNAPSE_SERVER: ${{ secrets.DBT_SYNAPSE_SERVER }}
+          DBT_SYNAPSE_DATABASE: ${{ secrets.DBT_SYNAPSE_DATABASE }}
+          DBT_SYNAPSE_USER: ${{ secrets.DBT_SYNAPSE_USER }}
+          DBT_SYNAPSE_PASSWORD: ${{ secrets.DBT_SYNAPSE_PASSWORD }}
+
+  # ── 3. dbt test on CI schema ─────────────────────────────────────────────────
+  dbt-test:
+    name: dbt tests
+    runs-on: ubuntu-latest
+    needs: dbt-compile
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dbt
+        run: pip install dbt-synapse dbt-utils
+
+      - name: dbt deps
+        working-directory: dbt_project
+        run: dbt deps
+
+      - name: dbt run on CI schema
+        working-directory: dbt_project
+        run: dbt run --profiles-dir ./ci_profiles --target ci --select staging+
+        env:
+          DBT_SYNAPSE_SERVER: ${{ secrets.DBT_SYNAPSE_SERVER }}
+          DBT_SYNAPSE_DATABASE: ${{ secrets.DBT_SYNAPSE_DATABASE }}
+          DBT_SYNAPSE_USER: ${{ secrets.DBT_SYNAPSE_USER }}
+          DBT_SYNAPSE_PASSWORD: ${{ secrets.DBT_SYNAPSE_PASSWORD }}
+
+      - name: dbt test
+        working-directory: dbt_project
+        run: dbt test --profiles-dir ./ci_profiles --target ci --select staging+ --store-failures
+        env:
+          DBT_SYNAPSE_SERVER: ${{ secrets.DBT_SYNAPSE_SERVER }}
+          DBT_SYNAPSE_DATABASE: ${{ secrets.DBT_SYNAPSE_DATABASE }}
+          DBT_SYNAPSE_USER: ${{ secrets.DBT_SYNAPSE_USER }}
+          DBT_SYNAPSE_PASSWORD: ${{ secrets.DBT_SYNAPSE_PASSWORD }}
+
+      - name: Upload dbt artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbt-artifacts
+          path: dbt_project/target/
+
+  # ── 4. Great Expectations schema validation ───────────────────────────────────
+  ge-schema-check:
+    name: GE suite validation
+    runs-on: ubuntu-latest
+    needs: python-checks
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install great-expectations sqlalchemy pyodbc
+
+      - name: Validate GE suite builds without errors
+        run: python quality/expectations_suite.py --run-id ci-${{ github.sha }} --fail-on-error
+        env:
+          SYNAPSE_CONN_STR: ${{ secrets.CI_SYNAPSE_CONN_STR }}

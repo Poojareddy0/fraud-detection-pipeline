@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.env
+*.env
+
+# dbt
+dbt_project/target/
+dbt_project/logs/
+dbt_project/dbt_packages/
+
+# Terraform — NEVER commit these
+infra/.terraform/
+infra/*.tfstate
+infra/*.tfstate.backup
+infra/*.tfvars
+
+# Credentials — NEVER commit these
+*.pem
+*.key
+secrets.yml

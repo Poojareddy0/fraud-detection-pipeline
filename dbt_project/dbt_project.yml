@@ -1,0 +1,39 @@
+name: fraud_detection
+version: '1.0.0'
+config-version: 2
+
+profile: fraud_detection
+
+model-paths: ["models"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+models:
+  fraud_detection:
+    staging:
+      +materialized: view
+      +schema: staging
+    intermediate:
+      +materialized: ephemeral
+    marts:
+      +materialized: table
+      +schema: marts
+      fct_fraud_events:
+        +materialized: incremental
+        +unique_key: transaction_id
+        +incremental_strategy: merge
+      dim_customers:
+        +materialized: table
+
+vars:
+  lookback_days: 90
+  fraud_score_threshold: 40
+
+# dbt contracts — schema enforcement on marts
+flags:
+  require_explicit_package_overrides_for_builtin_materializations: false

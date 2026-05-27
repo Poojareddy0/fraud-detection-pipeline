@@ -1,0 +1,94 @@
+version: 2
+
+sources:
+  - name: bronze
+    description: "Raw transaction data landed by PySpark Structured Streaming"
+    schema: bronze
+    tables:
+      - name: transactions
+        description: "All ingested transaction events from Azure Event Hubs"
+        freshness:
+          warn_after: {count: 30, period: minute}
+          error_after: {count: 60, period: minute}
+        loaded_at_field: ingested_at
+        columns:
+          - name: transaction_id
+            tests: [not_null, unique]
+          - name: customer_id
+            tests: [not_null]
+          - name: amount
+            tests:
+              - not_null
+              - dbt_utils.expression_is_true:
+                  expression: "> 0"
+
+
+models:
+  - name: stg_transactions
+    description: "Cleaned and typed transaction events from the bronze layer"
+    columns:
+      - name: transaction_id
+        description: "Unique transaction UUID"
+        tests: [not_null, unique]
+      - name: customer_id
+        tests: [not_null]
+      - name: amount_usd
+        tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              expression: "> 0"
+      - name: merchant_country_code
+        tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              expression: "length(merchant_country_code) = 2"
+      - name: merchant_category
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['GROCERY','ELECTRONICS','TRAVEL','DINING','GAS','ONLINE','ATM','OTHER']
+      - name: fraud_score
+        tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              expression: "between 0 and 100"
+
+  - name: fct_fraud_events
+    description: "Fact table — all transactions with fraud signals and customer enrichment"
+    columns:
+      - name: transaction_id
+        tests: [not_null, unique]
+      - name: customer_id
+        tests: [not_null]
+      - name: fraud_score
+        tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              expression: "between 0 and 100"
+      - name: transaction_ts
+        tests: [not_null]
+      - name: amount_usd
+        tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              expression: "> 0"
+
+  - name: dim_customers
+    description: "SCD Type 2 customer dimension with risk tier history"
+    columns:
+      - name: customer_sk
+        tests: [not_null, unique]
+      - name: customer_id
+        tests: [not_null]
+      - name: risk_tier
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['LOW', 'MEDIUM', 'HIGH']
+      - name: customer_segment
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['BASIC', 'STANDARD', 'PREMIUM']
+      - name: is_current
+        tests: [not_null]
