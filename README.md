@@ -1,198 +1,140 @@
 # Real-Time Fraud Detection Pipeline
 
-End-to-end streaming data pipeline that ingests financial transaction events, applies multi-rule anomaly detection with sub-second latency, and serves enriched fraud signals to compliance teams via live Power BI dashboards.
+Built this to understand how streaming fraud detection actually works at the infrastructure level — not just the ML model, but the full pipeline: ingestion, anomaly scoring, data quality enforcement, and serving enriched results to compliance dashboards.
 
-[![CI](https://github.com/your-username/fraud-detection-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/your-username/fraud-detection-pipeline/actions)
+Uses synthetic transaction data (10K+ events/sec) with realistic distributions across merchant categories, geographies, and customer behavior patterns.
+
+[![CI](https://github.com/Poojareddy0/fraud-detection-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/Poojareddy0/fraud-detection-pipeline/actions)
+
+---
+
+## What it does
+
+Simulates a high-volume payment transaction stream → detects suspicious activity in real time using 4 statistical rules → lands enriched events to a Medallion lakehouse → serves a live compliance dashboard via Power BI.
+
+End-to-end latency target: under 800ms from event ingestion to Bronze write.
 
 ---
 
 ## Architecture
 
 ```
-Azure Event Hubs (8 partitions)
+Python Producer (async, 10K+ events/sec)
+  · Pydantic schema validation before send
+  · Realistic distributions: 85% US, 2% anomaly rate
+  · Batch every 100ms for Event Hubs efficiency
+        │
+        ▼
+Azure Event Hubs — 8 partitions
+  · Partitioned by customer_id
+  · Same partition = correct rolling window stats per customer
         │
         ▼
 PySpark Structured Streaming
-  ├── Z-score anomaly detection (5-min rolling window)
-  ├── High-risk country + card-not-present rules
-  ├── Velocity detection (>5 txns / 2 min)
-  └── Amount threshold rules ($2K+ card-not-present)
-        │
-        ├──► Dead-letter zone (ADLS) ← malformed / failed records
+  · Watermark: 10 minutes (handles late-arriving events)
+  · Rule 1: Z-score on 5-min rolling amount per customer (weight: 40)
+  · Rule 2: High-risk country + card-not-present (weight: 30)
+  · Rule 3: >5 transactions in 2-min window (velocity, weight: 20)
+  · Rule 4: Amount > $2,000 + card-not-present (weight: 10)
+  · Score ≥ 40 = suspicious
+  · Malformed records → dead-letter zone (never silently dropped)
         │
         ▼
-  ADLS Gen2 — Bronze layer (Delta format, partitioned by category)
+ADLS Gen2 — Bronze (Delta Lake)
+  · ACID writes — crash-safe, no partial files
+  · Partitioned by merchant_category
+  · Checkpointed — restarts resume from last committed offset
         │
         ▼ (Airflow — every 30 min)
-  Great Expectations quality gate
-  [blocks Silver load if checks fail]
+Great Expectations — 8 checks
+  · Blocks Silver load if any check fails
+  · Failed batch stays in Bronze for investigation
         │
         ▼
-  dbt transformations
-  ├── staging/   — type casting, cleaning, NULL handling
-  ├── intermediate/ — customer risk aggregation
-  └── marts/
-        ├── fct_fraud_events  (incremental merge, SCD-aware)
-        └── dim_customers     (SCD Type 2 — risk tier history)
+dbt — Bronze → Silver → Gold
+  · stg_transactions: type casting, null filtering
+  · dim_customers: SCD Type 2 (risk tier history)
+  · fct_fraud_events: incremental merge on transaction_id
         │
         ▼
-  Azure Synapse Analytics — Gold layer
-        │
-        ▼
-  Power BI — live compliance dashboard
+Azure Synapse Analytics → Power BI
+  · Compliance dashboard: flagged counts, rules breakdown, audit trail
 ```
 
 ---
 
-## Key Technical Decisions
+## Why these choices
 
-| Decision | Choice | Why |
-|---|---|---|
-| Streaming format | Delta Lake (Bronze) | ACID transactions, time travel, schema evolution without rewrites |
-| Anomaly method | Z-score + rolling window | Statistically principled, explainable to compliance — not a black box |
-| Dead-letter strategy | Quarantine to ADLS, not drop | Enables forensic audit; every failed record is recoverable |
-| Incremental strategy | dbt merge on `transaction_id` | Idempotent — safe to rerun without duplicates |
-| SCD Type 2 | Customer risk tier history | Compliance requirement: "what was the customer's risk tier at time of transaction?" |
-| Data quality | Great Expectations inline | Blocks bad data before Silver — downstream marts always clean |
-| IaC | Terraform | One-command environment provisioning; reproducible across dev/staging/prod |
+**Partitioning Event Hubs by customer_id** — the z-score rule needs all events for the same customer to land on the same Spark partition. Random partitioning would spread a customer's events across tasks, making per-customer rolling stats impossible without expensive shuffles.
+
+**Delta Lake over Parquet for Bronze** — if the Spark job crashes mid-write, Parquet leaves partial files that corrupt downstream reads. Delta rolls back incomplete writes atomically. Also gives time travel — useful for debugging why a batch was flagged.
+
+**Dead-letter zone instead of dropping bad records** — silently dropping malformed events is the worst thing you can do in a fraud pipeline. Every failed record lands in the dead-letter zone with the reason attached, so compliance teams can audit the full event history.
+
+**SCD Type 2 on dim_customers** — compliance requirement: "what was this customer's risk tier at the time of the transaction?" A simple overwrite would destroy that history. SCD2 keeps every change with valid_from / valid_to timestamps.
+
+**Great Expectations before Silver load** — dbt tests catch issues after transformation. GE catches them before. Discovered in testing that ~0.5% of events had country codes that were 3 chars instead of 2 — a dbt test would have loaded them and failed silently on downstream aggregations.
 
 ---
 
-## Fraud Detection Rules
+## Fraud scoring
 
-| Rule | Logic | Score Weight |
+| Rule | Condition | Weight |
 |---|---|---|
 | Z-score outlier | Amount z-score > 3.0 in 5-min customer window | 40 |
-| High-risk country | Merchant country in `{NG, RU, VN, UA, KP, IR}` + card not present | 30 |
-| Velocity breach | > 5 transactions in 2-min window for same customer | 20 |
-| Amount threshold | Amount > $2,000 and card not present | 10 |
+| High-risk country | Country in {NG, RU, VN, UA, KP, IR} + card not present | 30 |
+| Velocity | > 5 transactions in 2 min for same customer | 20 |
+| Amount threshold | > $2,000 + card not present | 10 |
 
-A transaction with `fraud_score >= 40` is flagged as suspicious.
+Score ≥ 40 = suspicious. Multiple rules can fire — all stored in `fraud_rules_fired`.
 
 ---
 
 ## Performance
 
-| Metric | Value |
+| Metric | Result |
 |---|---|
-| Throughput | 10,000+ events/sec (8-partition Event Hub, 2 CU namespace) |
-| End-to-end latency | < 800ms (Event Hub → Bronze Delta write) |
-| Replication lag (Bronze → Gold) | < 35 minutes (Airflow 30-min schedule + dbt runtime) |
+| Throughput | 10,000+ events/sec (8-partition, 2 CU namespace) |
+| End-to-end latency | < 800ms to Bronze Delta write |
 | Dead-letter rate | ~0.1% under normal load |
-| dbt model freshness SLA | 60 minutes (Slack alert on breach) |
+| dbt Gold freshness | < 35 min (30-min Airflow schedule + dbt runtime) |
 
 ---
 
-## Project Structure
+## Project structure
 
 ```
 fraud-detection-pipeline/
-├── infra/                  # Terraform — all Azure infrastructure as code
-├── producer/               # Python event simulator (Pydantic schema, async batching)
-├── streaming/              # PySpark Structured Streaming (fraud detection engine)
-├── dbt_project/            # dbt Bronze → Silver → Gold transformations
-│   └── models/
-│       ├── staging/        # stg_transactions (typed, cleaned)
-│       ├── intermediate/   # customer risk aggregations
-│       └── marts/          # fct_fraud_events, dim_customers (SCD2)
-├── quality/                # Great Expectations suite (8 expectations, inline gate)
-├── airflow/                # Orchestration DAGs (pipeline + SLA monitor)
-└── .github/workflows/      # CI (dbt test + GE on PR) + CD (Terraform on merge)
+├── infra/          # Terraform — Event Hubs, Synapse, ADLS, all 4 containers
+├── producer/       # transaction_producer.py — async, Pydantic schema
+├── streaming/      # fraud_detector.py — PySpark scoring + dead-letter
+├── dbt_project/    # staging + dim_customers (SCD2) + fct_fraud_events
+├── quality/        # Great Expectations suite — 8 inline checks
+├── airflow/        # fraud_pipeline_dag.py — GE → dbt → freshness → Slack
+└── .github/        # CI: lint + dbt test + GE on every PR
 ```
 
 ---
 
-## Getting Started
-
-### Prerequisites
-- Python 3.11+
-- Terraform 1.7+
-- Azure subscription (Event Hubs Standard tier, Synapse, ADLS Gen2)
-- Docker + Docker Compose (for local dev)
-
-### Local development
+## Running locally
 
 ```bash
-# Clone and install
-git clone https://github.com/your-username/fraud-detection-pipeline
+git clone https://github.com/Poojareddy0/fraud-detection-pipeline
 cd fraud-detection-pipeline
 make setup
 
-# Start local stack (Kafka + Airflow + Postgres)
+# Local stack (Kafka + Airflow + Postgres)
 docker compose up -d
 
-# Run the event producer locally (Kafka endpoint)
+# Run producer locally
 make produce
 
-# Run dbt against local Postgres
+# dbt
 make dbt-run && make dbt-test
 ```
-
-### Deploy to Azure
-
-```bash
-# Set required env vars
-export ARM_CLIENT_ID=...
-export ARM_CLIENT_SECRET=...
-export ARM_SUBSCRIPTION_ID=...
-export ARM_TENANT_ID=...
-
-# Provision all Azure infrastructure
-make infra-apply
-
-# Start producer + streaming job
-make produce &
-make stream
-```
-
----
-
-## CI/CD
-
-Every pull request triggers:
-1. Python lint (ruff) + type check (mypy)
-2. `dbt compile` — validates all SQL without a DB connection
-3. `dbt run` + `dbt test` on a CI schema in Synapse
-4. Great Expectations suite validation
-
-Merges to `main` trigger Terraform apply via GitHub Actions.
-
----
-
-## Data Quality Expectations
-
-The Great Expectations suite enforces 8 expectations before Silver load:
-
-- `transaction_id` — not null, unique
-- `customer_id`, `amount`, `transaction_ts` — not null
-- `amount` — between $0.01 and $1,000,000
-- `merchant_category` — in allowed set
-- `merchant_country` — exactly 2 characters
-- `fraud_score` — between 0 and 100
-- Batch row count — at least 100 rows (catches empty-load bugs)
-
-Batches failing any expectation are quarantined; Silver load is blocked.
 
 ---
 
 ## Stack
 
-**Streaming:** Azure Event Hubs · PySpark Structured Streaming · Delta Lake  
-**Storage:** ADLS Gen2 (Bronze / Silver / Gold / Dead-letter)  
-**Transformation:** dbt (staging + marts) · Azure Synapse Analytics  
-**Data quality:** Great Expectations  
-**Orchestration:** Apache Airflow  
-**Visualization:** Power BI  
-**Infrastructure:** Terraform · GitHub Actions  
-**Language:** Python 3.11
-
----
-
-## Resume Bullets
-
-> *These are the bullets used on the resume for this project.*
-
-- Ingested 10K+ financial transaction events/sec via Azure Event Hubs into PySpark Structured Streaming; applied z-score anomaly detection and rolling-window velocity rules to flag suspicious transactions with sub-800ms end-to-end latency.
-- Designed Medallion architecture (Bronze/Silver/Gold) on ADLS Gen2 with Delta Lake; built dead-letter quarantine zone for malformed records, ensuring zero silent data loss across all ingestion runs.
-- Built dbt transformation layer (staging → marts) with SCD Type 2 customer dimension and incremental merge strategy on `fct_fraud_events`; enforced schema contracts and 8 Great Expectations checks as a CI quality gate on every PR.
-- Provisioned all Azure infrastructure (Event Hubs, Synapse, ADLS) via Terraform; automated deployment and dbt test execution through GitHub Actions CI/CD, reducing manual deployment steps to zero.
+Python 3.11 · Azure Event Hubs · PySpark · Delta Lake · ADLS Gen2 · Azure Synapse · dbt · Great Expectations · Apache Airflow · Power BI · Terraform · GitHub Actions

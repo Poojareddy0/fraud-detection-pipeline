@@ -19,3 +19,4 @@ infra/*.tfvars
 *.pem
 *.key
 secrets.yml
+.DS_Store
